@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">ListenBrainz PowerAmp</string>
+    <string name="title_activity_settings">SettingsActivity</string>
+
+
+    <!-- Messages Preferences -->
+    <string name="signature_title">ListenBrainz Token</string>
+</resources>

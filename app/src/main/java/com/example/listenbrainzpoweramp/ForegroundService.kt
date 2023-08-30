@@ -1,0 +1,274 @@
+package com.example.listenbrainzpoweramp
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.net.Uri
+import android.os.Bundle
+import android.os.IBinder
+import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
+import android.util.Log
+import androidx.preference.PreferenceManager
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStream
+
+
+class ForegroundService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
+    var mTrackIntent: Intent? = null
+    var mStatusIntent: Intent? = null
+    // var mPlayingModeIntent: Intent? = null
+    var isStarted: Boolean = false
+
+    init {
+        System.loadLibrary("lbp_native")
+        initrs(this)
+    }
+
+    private external fun mTrackFunction(
+        path: String,
+        ext: String,
+        dur: Int,
+        pos: Int,
+    )
+
+    private external fun mStatusFunction(state: Int)
+
+    private external fun initrs(self: ForegroundService)
+
+    private external fun setToken(token: String)
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isStarted = false
+        PreferenceManager.getDefaultSharedPreferences(this)
+            .unregisterOnSharedPreferenceChangeListener(this)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!isStarted) {
+            isStarted = true
+            PreferenceManager.getDefaultSharedPreferences(this)
+                .registerOnSharedPreferenceChangeListener(this)
+
+            val chan: NotificationChannel = NotificationChannel(
+                "ForegroundServiceChannel",
+                "Foreground Service Channel", NotificationManager.IMPORTANCE_NONE
+            )
+
+            val service = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            service.createNotificationChannel(chan)
+            threadStopped()
+
+            val mTrackReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    mTrackIntent = intent
+                    val mCurrentTrack: Bundle? = intent.getBundleExtra("track")
+                    if (mCurrentTrack != null) {
+                        var mPath = mCurrentTrack.getString("path").orEmpty()
+                        mPath = mPath.substring(
+                            0,
+                            mPath.indexOf("/")
+                        ) + ":" + mPath.substring(mPath.indexOf("/") + 1)
+                        Log.v("ForegroundService", mPath)
+                        applicationContext.contentResolver.persistedUriPermissions.forEach {
+                            val path = openContentFd(
+                                DocumentsContract.buildChildDocumentsUriUsingTree(it.uri, mPath)
+                            )
+                            if (path != null) {
+                                val ext = mPath.substring(mPath.lastIndexOf(".") + 1)
+                                val dur = mCurrentTrack.getInt("durMs", -1)
+                                val pos = intent.getIntExtra("pos", 0)
+                                Log.v("ForegroundService", "Pos: $pos")
+                                mTrackFunction(path, ext, dur, pos)
+                                return
+                            }
+                        }
+                        notScrobbling()
+                    }
+
+                    // processTrackIntent()
+                    Log.w("ForegroundService", "mTrackReceiver $intent")
+                }
+            }
+
+            val mStatusReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    mStatusIntent = intent
+                    mStatusFunction(intent.getIntExtra("state", -1))
+                    Log.w("ForegroundService", "mStatusReceiver $intent")
+                }
+            }
+
+            /*
+            val mPlayingModeReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    mPlayingModeIntent = intent
+                    Log.w("ForegroundService", "mPlayingModeReceiver $intent")
+                }
+            }
+            */
+
+
+            mTrackIntent =
+                registerReceiver(
+                    mTrackReceiver,
+                    IntentFilter("com.maxmpz.audioplayer.TRACK_CHANGED")
+                )
+            mStatusIntent =
+                registerReceiver(
+                    mStatusReceiver,
+                    IntentFilter("com.maxmpz.audioplayer.STATUS_CHANGED")
+                )
+            /*
+            mPlayingModeIntent = registerReceiver(
+                mPlayingModeReceiver,
+                IntentFilter("com.maxmpz.audioplayer.PLAYING_MODE_CHANGED")
+            )
+            */
+        }
+
+        return START_NOT_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
+
+    fun threadStopped() {
+        val notificationIntent = Intent(this, SettingsActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification: Notification = Notification.Builder(this, "ForegroundServiceChannel")
+            .setContentTitle("PowerAmp ListenBrainz")
+            .setContentText("The service is sleeping")
+            .setOngoing(true)
+            .setSmallIcon(R.drawable.baseline_close)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        startForeground(1, notification)
+    }
+
+    fun isScrobbling() {
+        val notificationIntent = Intent(this, SettingsActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification: Notification = Notification.Builder(this, "ForegroundServiceChannel")
+            .setContentTitle("PowerAmp ListenBrainz")
+            .setContentText("The service is running")
+            .setOngoing(true)
+            .setSmallIcon(R.drawable.baseline_book)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        startForeground(1, notification)
+    }
+
+    fun notScrobbling() {
+        val notificationIntent = Intent(this, SettingsActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification: Notification = Notification.Builder(this, "ForegroundServiceChannel")
+            .setContentTitle("PowerAmp ListenBrainz")
+            .setContentText("The service is not scrobbling this song")
+            .setOngoing(true)
+            .setSmallIcon(R.drawable.baseline_block)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        startForeground(1, notification)
+    }
+
+    fun getToken(): String {
+        val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(this)
+        return "Token " + sharedPreferences.getString("token", "")
+    }
+
+    fun getCache(): String {
+        return cacheDir.absolutePath.toString()
+    }
+
+    /*
+    private fun parsePathFromIntent(intent: Intent): String? {
+        val filepath: String?
+        filepath = when (intent.action) {
+            Intent.ACTION_VIEW -> intent.data?.let { openContentFd(it) }
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)?.let {
+                val uri = Uri.parse(it.trim())
+                if (uri.isHierarchical && !uri.isRelative) openContentFd(uri) else null
+            }
+            else -> intent.getStringExtra("filepath")
+        }
+        return filepath
+    }
+    */
+
+    private fun openContentFd(uri: Uri): String? {
+        val resolver = applicationContext.contentResolver
+        Log.v("ForegroundService", "Resolving content URI: $uri")
+
+        val fd = try {
+            val desc = resolver.openFileDescriptor(uri, "r")
+            desc!!.detachFd()
+        } catch (e: Exception) {
+            Log.e("ForegroundService", "Failed to open content fd: $e")
+            return null
+        }
+        // See if we skip the indirection and read the real file directly
+        val path = findRealPath(fd)
+        if (path != null) {
+            Log.v("ForegroundService", "Found real file path: $path")
+            ParcelFileDescriptor.adoptFd(fd).close() // we don't need that anymore
+            return path
+        }
+        // Else, pass the fd to mpv
+        return "fd://${fd}"
+    }
+
+    private fun findRealPath(fd: Int): String? {
+        var ins: InputStream? = null
+        try {
+            val path = File("/proc/self/fd/${fd}").canonicalPath
+            if (!path.startsWith("/proc") && File(path).canRead()) {
+                // Double check that we can read it
+                ins = FileInputStream(path)
+                ins.read()
+                return path
+            }
+        } catch (e: Exception) {
+        } finally {
+            ins?.close()
+        }
+        return null
+    }
+
+    override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
+        if (key == "token") {
+            setToken(getToken())
+        }
+    }
+}
