@@ -17,16 +17,34 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.util.Log
 import androidx.preference.PreferenceManager
+import de.justjanne.bitflags.Flag
+import de.justjanne.bitflags.Flags
+import de.justjanne.bitflags.none
+import de.justjanne.bitflags.toBits
+import de.justjanne.bitflags.toEnumSet
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
 
+enum class MetadataReqFlag(
+    override val value: Byte,
+) : Flag<Byte> {
+    Artist(1),
+    Title(2),
+    Album(4),
+    ReleaseMBID(8),
+    ArtistMBIDS(16),
+    RecordingMBID(32);
+    companion object : Flags<Byte, MetadataReqFlag> {
+        override val all: Set<MetadataReqFlag> = values().toEnumSet()
+    }
+}
 
 class ForegroundService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
     var mTrackIntent: Intent? = null
     var mStatusIntent: Intent? = null
     // var mPlayingModeIntent: Intent? = null
-    var isStarted: Boolean = false
+    private var isStarted: Boolean = false
 
     init {
         System.loadLibrary("lbp_native")
@@ -38,6 +56,7 @@ class ForegroundService : Service(), SharedPreferences.OnSharedPreferenceChangeL
         ext: String,
         dur: Int,
         pos: Int,
+        metadataReqs: Byte
     )
 
     private external fun mStatusFunction(state: Int)
@@ -83,12 +102,33 @@ class ForegroundService : Service(), SharedPreferences.OnSharedPreferenceChangeL
                             val path = openContentFd(
                                 DocumentsContract.buildChildDocumentsUriUsingTree(it.uri, mPath)
                             )
+                            val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+                            val reqs = MetadataReqFlag.none()
+
+                            if (sharedPreferences.getBoolean("artist_req", false)) {
+                                reqs.add(MetadataReqFlag.Artist)
+                            }
+                            if (sharedPreferences.getBoolean("title_req", false)) {
+                                reqs.add(MetadataReqFlag.Title)
+                            }
+                            if (sharedPreferences.getBoolean("album_req", false)) {
+                                reqs.add(MetadataReqFlag.Album)
+                            }
+                            if (sharedPreferences.getBoolean("release_mbid_req", false)) {
+                                reqs.add(MetadataReqFlag.ReleaseMBID)
+                            }
+                            if (sharedPreferences.getBoolean("artist_mbid_req", false)) {
+                                reqs.add(MetadataReqFlag.ArtistMBIDS)
+                            }
+                            if (sharedPreferences.getBoolean("recording_mbid_req", false)) {
+                                reqs.add(MetadataReqFlag.RecordingMBID)
+                            }
                             if (path != null) {
                                 val ext = mPath.substring(mPath.lastIndexOf(".") + 1)
                                 val dur = mCurrentTrack.getInt("durMs", -1)
                                 val pos = intent.getIntExtra("pos", 0)
                                 Log.v("ForegroundService", "Pos: $pos")
-                                mTrackFunction(path, ext, dur, pos)
+                                mTrackFunction(path, ext, dur, pos, reqs.toBits())
                                 return
                             }
                         }

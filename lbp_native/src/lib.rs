@@ -4,22 +4,19 @@ use std::{
     num::NonZeroU64,
     os::fd::FromRawFd,
     path::{Path, PathBuf},
-    sync::{
-        mpsc::{Receiver, Sender},
-        Arc, OnceLock,
-    },
+    sync::OnceLock,
     time::{Duration, Instant, SystemTime},
 };
 
+use flume::{Receiver, RecvTimeoutError, Sender};
 use num_enum::FromPrimitive;
 use parking_lot::Mutex;
 
 use jni::{
     objects::{GlobalRef, JClass, JObject, JString, JValueGen},
-    sys::jint,
+    sys::{jbyte, jint},
     JNIEnv,
 };
-use polling::Poller;
 use serde::Serialize;
 use symphonia::core::{
     formats::FormatOptions,
@@ -69,7 +66,7 @@ struct Payload {
 }
 
 #[derive(Serialize, Default, Debug)]
-struct TrackMetadata {
+pub struct TrackMetadata {
     additional_info: AdditionalInfo,
     artist_name: String,
     track_name: String,
@@ -99,7 +96,7 @@ struct LoveHate<'a> {
 impl Default for AdditionalInfo {
     fn default() -> Self {
         Self {
-            media_player: "mpv",
+            media_player: "PowerAmp",
             submission_client: "ListenBrainz PowerAmp",
             submission_client_version: env!("CARGO_PKG_VERSION"),
             release_mbid: String::new(),
@@ -110,39 +107,40 @@ impl Default for AdditionalInfo {
     }
 }
 
-enum Event {
+#[derive(Debug)]
+pub enum Event {
     TrackChanged(TrackMetadata, jint, Instant, bool),
     StateChanged(PowerampState),
     SetToken(String),
 }
 
+bitflags::bitflags! {
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct MetadataReqFlags: jbyte {
+        const ARTIST = 1;
+        const TITLE = 2;
+        const ALBUM = 4;
+        const RELEASE_MBID = 8;
+        const ARTIST_MBIDS = 16;
+        const RECORDING_MBID = 32;
+    }
+}
+
+impl std::fmt::Display for MetadataReqFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        bitflags::parser::to_writer(self, f)
+    }
+}
+
 #[derive(Debug, Default, FromPrimitive)]
 #[repr(i32)]
-enum PowerampState {
+pub enum PowerampState {
     #[default]
     NoState = -1,
     Stopped = 0,
     Playing = 1,
     Paused = 2,
-}
-
-#[derive(Debug)]
-pub struct NotifierSender<T> {
-    sender: Sender<T>,
-    poller: Arc<Poller>,
-}
-
-impl<T> NotifierSender<T> {
-    /// Send a message to the channel
-    ///
-    /// This will wake the event loop and deliver an `Event::Msg` to
-    /// it containing the provided value.
-    pub fn send(&self, t: T) -> Result<(), std::io::Error> {
-        self.sender
-            .send(t)
-            .map(|()| self.poller.notify())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotConnected))?
-    }
 }
 
 fn scrobble(listen_type: &'static str, payload: &Payload, token: &str, cache_path: &Path) {
@@ -151,7 +149,7 @@ fn scrobble(listen_type: &'static str, payload: &Payload, token: &str, cache_pat
         payload: [payload],
     };
     #[cfg(debug_assertions)]
-    eprintln!("{}", serde_json::to_string_pretty(&send).unwrap());
+    log::debug!("{}", serde_json::to_string_pretty(&send).unwrap());
     let status = ureq::post("https://api.listenbrainz.org/1/submit-listens")
         .set("Authorization", token)
         .send_json(send);
@@ -180,8 +178,8 @@ fn import_cache(token: &str, cache_path: &Path) {
         } else {
             br#"{"listen_type":"import","payload":["#.to_vec()
         };
-        for i in std::fs::read_dir(&cache_path).unwrap() {
-            let path = i.unwrap().path();
+        for i in std::fs::read_dir(&cache_path).unwrap().map(|f| f.unwrap()) {
+            let path = i.path();
             std::io::copy(
                 &mut std::fs::File::open(path.as_path()).unwrap(),
                 &mut request,
@@ -192,13 +190,13 @@ fn import_cache(token: &str, cache_path: &Path) {
         request.pop();
         request.extend_from_slice(b"]}");
         #[cfg(debug_assertions)]
-        eprintln!("{}", unsafe { std::str::from_utf8_unchecked(&request) });
+        log::debug!("{}", unsafe { std::str::from_utf8_unchecked(&request) });
         let status = ureq::post("https://api.listenbrainz.org/1/submit-listens")
             .set("Authorization", token)
             .set("Content-Type", "json")
             .send_bytes(&request);
         if status.is_err() {
-            eprintln!("Error importing {:?}", status);
+            log::debug!("Error importing {:?}", status);
             return;
         }
         std::fs::read_dir(cache_path)
@@ -218,93 +216,76 @@ macro_rules! scrobble_duration {
     };
 }
 
-static EVENT_LOOP_SENDER: Mutex<Option<NotifierSender<Event>>> = Mutex::new(None);
+static EVENT_LOOP_SENDER: Mutex<Option<Sender<Event>>> = Mutex::new(None);
 static JOBJECT: OnceLock<GlobalRef> = OnceLock::new();
 
-fn init_thread(rx: Receiver<Event>, token: String, cache_path: PathBuf, poller: Arc<Poller>) {
+fn init_thread(event: Event, env: &mut JNIEnv, lock: &mut Option<Sender<Event>>) {
+    let token = env
+        .call_method(
+            JOBJECT.get().unwrap(),
+            "getToken",
+            "()Ljava/lang/String;",
+            &[],
+        )
+        .unwrap();
+    let token_jstring = match token {
+        JValueGen::Object(o) => JString::from(o),
+        _ => unreachable!(),
+    };
+    let token_javastr = env.get_string(&token_jstring).unwrap();
+    let token_c_str = unsafe { CStr::from_ptr(token_javastr.as_ptr()) };
+    let token = token_c_str.to_str().unwrap().to_string();
+    let cache_path = env
+        .call_method(
+            JOBJECT.get().unwrap(),
+            "getCache",
+            "()Ljava/lang/String;",
+            &[],
+        )
+        .unwrap();
+    let cache_path_jstring = match cache_path {
+        JValueGen::Object(o) => JString::from(o),
+        _ => unreachable!(),
+    };
+    let cache_path_javastr = env.get_string(&cache_path_jstring).unwrap();
+    let cache_path_c_str = unsafe { CStr::from_ptr(cache_path_javastr.as_ptr()) };
+    let cache_path = Path::new(cache_path_c_str.to_str().unwrap()).join("listenbrainz");
+    if !cache_path.exists() {
+        std::fs::create_dir(&cache_path).unwrap();
+    }
+    let mut data = ListenbrainzData {
+        token,
+        cache_path,
+        ..Default::default()
+    };
+    import_cache(&data.token, &data.cache_path);
+    // Maximum 2 events at a time. Track, and Status
+    let (tx, rx): (Sender<Event>, Receiver<Event>) = flume::bounded(2);
+
+    *lock = Some(tx);
     std::thread::spawn(move || {
-        let mut data = ListenbrainzData {
-            token,
-            cache_path,
-            ..Default::default()
-        };
-        import_cache(&data.token, &data.cache_path);
-        let mut events = Vec::new();
+        log::info!("Opening thread");
 
+        handle_event(event, &mut data);
         'mainloop: loop {
-            events.clear();
-            poller
-                .wait(
-                    &mut events,
-                    if data.timeout {
-                        match data.scrobble_deadline.duration_since(Instant::now()) {
-                            Duration::ZERO => None,
-                            timeout => Some(timeout),
-                        }
-                    } else {
-                        None
-                    },
-                )
-                .unwrap();
-            let mut iter = rx.try_iter().peekable();
-            match iter.peek() {
-                Some(_) => {
-                    for event in iter {
-                        match event {
-                            Event::TrackChanged(metadata, pos, now, data_scrobble) => {
-                                data.payload.track_metadata = metadata;
-                                let pos = Duration::from_secs(pos as _);
-
-                                data.scrobble = data_scrobble;
-
-                                if data.scrobble {
-                                    let mut scrobble_deadline =
-                                        Duration::from_millis(scrobble_duration!(
-                                            data.payload.track_metadata.additional_info.duration_ms,
-                                            1
-                                        ));
-
-                                    if pos < scrobble_deadline {
-                                        scrobble_deadline -= pos;
-                                    } else {
-                                        data.scrobble = false;
-                                        return;
-                                    }
-
-                                    data.scrobble_deadline = now + scrobble_deadline;
-
-                                    data.payload.listened_at = None;
-                                    scrobble(
-                                        "playing_now",
-                                        &data.payload,
-                                        &data.token,
-                                        &data.cache_path,
-                                    );
-                                }
-                                data.timeout = data.scrobble && !data.paused;
-                            }
-                            Event::StateChanged(state) => match state {
-                                PowerampState::NoState | PowerampState::Stopped => {
-                                    *EVENT_LOOP_SENDER.lock() = None;
-                                    break 'mainloop;
-                                }
-                                PowerampState::Paused => {
-                                    data.pause_instant = Instant::now();
-                                    data.timeout = false;
-                                    data.paused = true;
-                                }
-                                PowerampState::Playing => {
-                                    data.scrobble_deadline =
-                                        data.scrobble_deadline + data.pause_instant.elapsed();
-                                    data.timeout = true;
-                                    data.paused = false;
-                                }
-                            },
-                            Event::SetToken(token) => data.token = token,
-                        }
-                    }
+            let event = if data.timeout {
+                if Instant::now() >= data.scrobble_deadline {
+                    log::info!("Waiting");
+                    rx.recv().map_err(|e| e.into())
+                } else {
+                    log::info!(
+                        "Waiting: {:?}",
+                        data.scrobble_deadline.duration_since(Instant::now())
+                    );
+                    rx.recv_deadline(data.scrobble_deadline)
                 }
-                None => {
+            } else {
+                log::info!("Waiting");
+                rx.recv().map_err(|e| e.into())
+            };
+            match event {
+                Ok(event) => handle_event(event, &mut data),
+                Err(RecvTimeoutError::Timeout) => {
                     if data.scrobble {
                         data.payload.listened_at = NonZeroU64::new(
                             SystemTime::now()
@@ -317,9 +298,59 @@ fn init_thread(rx: Receiver<Event>, token: String, cache_path: PathBuf, poller: 
                     data.scrobble = false;
                     data.timeout = false;
                 }
+                Err(RecvTimeoutError::Disconnected) => break 'mainloop,
             }
         }
+        log::info!("Closing thread");
     });
+}
+
+fn handle_event(event: Event, data: &mut ListenbrainzData) {
+    match event {
+        Event::TrackChanged(metadata, pos, now, data_scrobble) => {
+            data.payload.track_metadata = metadata;
+            let pos = Duration::from_secs(pos as _);
+
+            data.scrobble = data_scrobble;
+            data.timeout = data.scrobble && !data.paused;
+
+            if data.scrobble {
+                let mut scrobble_deadline = Duration::from_millis(scrobble_duration!(
+                    data.payload.track_metadata.additional_info.duration_ms,
+                    1
+                ));
+
+                if pos < scrobble_deadline {
+                    scrobble_deadline -= pos;
+                } else {
+                    data.scrobble = false;
+                    return;
+                }
+
+                data.scrobble_deadline = now + scrobble_deadline;
+
+                data.payload.listened_at = None;
+                scrobble("playing_now", &data.payload, &data.token, &data.cache_path);
+            }
+        }
+        Event::StateChanged(state) => match state {
+            PowerampState::Paused => {
+                data.pause_instant = Instant::now();
+                data.timeout = false;
+                data.paused = true;
+            }
+            PowerampState::Playing => {
+                data.scrobble_deadline = data.scrobble_deadline + data.pause_instant.elapsed();
+                data.timeout = true;
+                data.paused = false;
+            }
+            // Receiver will get disconnected anyway
+            PowerampState::NoState | PowerampState::Stopped => {}
+        },
+        Event::SetToken(token) => {
+            data.token = token;
+        }
+    }
 }
 
 fn send_event(event: Event, env: &mut JNIEnv) {
@@ -327,42 +358,7 @@ fn send_event(event: Event, env: &mut JNIEnv) {
     if let Some(tx) = std::ops::Deref::deref(&lock) {
         tx.send(event).unwrap();
     } else {
-        let (tx, rx): (Sender<Event>, Receiver<Event>) = std::sync::mpsc::channel();
-
-        let token = env
-            .call_method(
-                JOBJECT.get().unwrap(),
-                "getToken",
-                "()Ljava/lang/String;",
-                &[],
-            )
-            .unwrap();
-        let token_jstring = match token {
-            JValueGen::Object(o) => JString::from(o),
-            _ => unreachable!(),
-        };
-        let token_javastr = env.get_string(&token_jstring).unwrap();
-        let token_c_str = unsafe { CStr::from_ptr(token_javastr.as_ptr()) };
-        let token_rust = token_c_str.to_str().unwrap().to_string();
-        let cache_path = env
-            .call_method(
-                JOBJECT.get().unwrap(),
-                "getCache",
-                "()Ljava/lang/String;",
-                &[],
-            )
-            .unwrap();
-        let cache_path_jstring = match cache_path {
-            JValueGen::Object(o) => JString::from(o),
-            _ => unreachable!(),
-        };
-        let cache_path_javastr = env.get_string(&cache_path_jstring).unwrap();
-        let cache_path_c_str = unsafe { CStr::from_ptr(cache_path_javastr.as_ptr()) };
-        let cache_path_rust = Path::new(cache_path_c_str.to_str().unwrap()).to_path_buf();
-        let poller = Arc::new(Poller::new().unwrap());
-        init_thread(rx, token_rust, cache_path_rust, Arc::clone(&poller));
-        tx.send(event).unwrap();
-        *lock = Some(NotifierSender { sender: tx, poller });
+        init_thread(event, env, &mut lock);
     }
 }
 
@@ -375,6 +371,51 @@ pub extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundService_i
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Trace),
     );
+    /*
+    std::panic::set_hook(Box::new(|panic_info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>");
+
+        let msg = match panic_info.payload().downcast_ref::<&'static str>() {
+            Some(s) => *s,
+            None => match panic_info.payload().downcast_ref::<String>() {
+                Some(s) => &**s,
+                None => "Box<Any>",
+            },
+        };
+
+        let mut path = String::new();
+        for path_num in 0.. {
+            path = format!("/storage/emulated/0/listenbrainz-{}.crash", path_num);
+            match Path::new(&path).try_exists() {
+                Ok(true) => break,
+                Ok(false) => continue,
+                Err(_) => return,
+            }
+        }
+
+        match panic_info.location() {
+            Some(location) => {
+                let _ = std::fs::write(
+                    &path,
+                    format!(
+                        "panic on thread '{}' panicked at '{}': {}:{}",
+                        thread,
+                        msg,
+                        location.file(),
+                        location.line(),
+                    ),
+                );
+            }
+            None => {
+                let _ = std::fs::write(
+                    &path,
+                    format!("panic on thread '{}' panicked at '{}'", thread, msg),
+                );
+            }
+        }
+    }));
+    */
     log_panics::init();
     JOBJECT.set(env.new_global_ref(callback).unwrap()).unwrap();
 }
@@ -402,6 +443,7 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
     ext: JString,
     dur: jint,
     pos: jint,
+    metadata_reqs: jbyte,
 ) {
     let now = Instant::now();
 
@@ -465,8 +507,8 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
                     Some(StandardTagKey::Artist) => {
                         track_metadata.artist_name = {
                             let Value::String(tag) = tag.value else {
-                        unreachable!()
-                    };
+                                unreachable!()
+                            };
 
                             tag
                         }
@@ -474,8 +516,8 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
                     Some(StandardTagKey::TrackTitle) => {
                         track_metadata.track_name = {
                             let Value::String(tag) = tag.value else {
-                        unreachable!()
-                    };
+                                unreachable!()
+                            };
 
                             tag
                         }
@@ -483,8 +525,8 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
                     Some(StandardTagKey::Album) => {
                         track_metadata.release_name = {
                             let Value::String(tag) = tag.value else {
-                        unreachable!()
-                    };
+                                unreachable!()
+                            };
 
                             tag
                         }
@@ -492,8 +534,8 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
                     Some(StandardTagKey::MusicBrainzAlbumId) => {
                         track_metadata.additional_info.release_mbid = {
                             let Value::String(tag) = tag.value else {
-                        unreachable!()
-                    };
+                                unreachable!()
+                            };
 
                             tag
                         }
@@ -501,8 +543,8 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
                     Some(StandardTagKey::MusicBrainzArtistId) => {
                         track_metadata.additional_info.artist_mbids.push({
                             let Value::String(tag) = tag.value else {
-                        unreachable!()
-                    };
+                                unreachable!()
+                            };
 
                             tag
                         })
@@ -519,10 +561,35 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
             }
 
             log::debug!("{:#?}", track_metadata);
-            let scrobble = !track_metadata.artist_name.is_empty()
-                && !track_metadata.track_name.is_empty()
-                && !track_metadata.release_name.is_empty()
-                && !track_metadata.additional_info.release_mbid.is_empty();
+            let metadata_reqs = MetadataReqFlags::from_bits(metadata_reqs).unwrap();
+            log::debug!("Reqs: {}", metadata_reqs);
+            let mut scrobble = true;
+            for req in metadata_reqs {
+                match req {
+                    MetadataReqFlags::ARTIST => {
+                        scrobble = scrobble && !track_metadata.artist_name.is_empty()
+                    }
+                    MetadataReqFlags::TITLE => {
+                        scrobble = scrobble && !track_metadata.track_name.is_empty()
+                    }
+                    MetadataReqFlags::ALBUM => {
+                        scrobble = scrobble && !track_metadata.release_name.is_empty()
+                    }
+                    MetadataReqFlags::RELEASE_MBID => {
+                        scrobble =
+                            scrobble && !track_metadata.additional_info.release_mbid.is_empty()
+                    }
+                    MetadataReqFlags::ARTIST_MBIDS => {
+                        scrobble =
+                            scrobble && !track_metadata.additional_info.artist_mbids.is_empty()
+                    }
+                    MetadataReqFlags::RECORDING_MBID => {
+                        scrobble =
+                            scrobble && !track_metadata.additional_info.recording_mbid.is_empty()
+                    }
+                    _ => unreachable!(),
+                }
+            }
             if scrobble {
                 env.call_method(JOBJECT.get().unwrap(), "isScrobbling", "()V", &[])
                     .unwrap();
@@ -553,16 +620,13 @@ pub unsafe extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundSe
     log::debug!("State: {:?}", state);
     match state {
         PowerampState::NoState | PowerampState::Stopped => {
-            let lock_occupied = {
-                let lock = EVENT_LOOP_SENDER.lock();
-                lock.is_some()
-            };
-            if lock_occupied {
-                env.call_method(JOBJECT.get().unwrap(), "threadStopped", "()V", &[])
-                    .unwrap();
-            }
+            let mut lock = EVENT_LOOP_SENDER.lock();
+            *lock = None;
+            env.call_method(JOBJECT.get().unwrap(), "threadStopped", "()V", &[])
+                .unwrap();
         }
-        _ => {}
+        _ => {
+            send_event(Event::StateChanged(state), &mut env);
+        }
     }
-    send_event(Event::StateChanged(state), &mut env);
 }

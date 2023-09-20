@@ -11,4 +11,26 @@
             app:summary="This service needs access to your music directory(ies) in order to read your music's metadata"
                 />
 
+        <PreferenceCategory
+            app:title="Metadata required to scrobble" >
+                <CheckBoxPreference
+                    app:title="Artist"
+                    app:key="artist_req" />
+                <CheckBoxPreference
+                    app:title="Title"
+                    app:key="title_req" />
+                <CheckBoxPreference
+                    app:title="Album"
+                    app:key="album_req" />
+                <CheckBoxPreference
+                    app:title="Release MBID"
+                    app:key="release_mbid_req" />
+                <CheckBoxPreference
+                    app:title="Artist MBIDs"
+                    app:key="artist_mbid_req" />
+                <CheckBoxPreference
+                    app:title="Recording MBID"
+                    app:key="recording_mbid_req" />
+        </PreferenceCategory>
+
 </PreferenceScreen>
