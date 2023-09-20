@@ -1,6 +1,7 @@
 *.iml
 .ccls-cache
 .gradle
+/app/src/release
 /local.properties
 /.idea/caches
 /.idea/libraries
