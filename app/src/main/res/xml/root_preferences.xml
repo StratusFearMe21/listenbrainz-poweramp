@@ -33,4 +33,7 @@
                     app:key="recording_mbid_req" />
         </PreferenceCategory>
 
+        <PreferenceCategory app:title="This app runs in the background. Once you've input all these settings, you can simply start listening to music">
+        </PreferenceCategory>
+
 </PreferenceScreen>
