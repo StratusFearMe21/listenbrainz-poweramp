@@ -83,7 +83,7 @@ where
     s.collect_seq(
         mbids
             .iter()
-            .flat_map(|mbid| uuid_regex.find(mbid).map(|m| m.as_str())),
+            .flat_map(|mbid| uuid_regex.find_iter(mbid).map(|m| m.as_str())),
     )
 }
 
