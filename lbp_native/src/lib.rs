@@ -1,5 +1,6 @@
 use std::{
     ffi::CStr,
+    fmt::Debug,
     io::BufWriter,
     num::NonZeroU64,
     os::fd::FromRawFd,
@@ -17,7 +18,8 @@ use jni::{
     sys::{jbyte, jint},
     JNIEnv,
 };
-use serde::Serialize;
+use regex::Regex;
+use serde::{Serialize, Serializer};
 use symphonia::core::{
     formats::FormatOptions,
     io::MediaSourceStream,
@@ -73,6 +75,18 @@ pub struct TrackMetadata {
     release_name: String,
 }
 
+fn serialize_artist_mbids<S>(mbids: &Vec<String>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let uuid_regex = UUID_REGEX.get().unwrap();
+    s.collect_seq(
+        mbids
+            .iter()
+            .flat_map(|mbid| uuid_regex.find(mbid).map(|m| m.as_str())),
+    )
+}
+
 #[derive(Serialize, Debug)]
 struct AdditionalInfo {
     media_player: &'static str,
@@ -80,7 +94,10 @@ struct AdditionalInfo {
     submission_client_version: &'static str,
     #[serde(skip_serializing_if = "String::is_empty")]
     release_mbid: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_artist_mbids"
+    )]
     artist_mbids: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     recording_mbid: String,
@@ -217,6 +234,7 @@ macro_rules! scrobble_duration {
 }
 
 static EVENT_LOOP_SENDER: Mutex<Option<Sender<Event>>> = Mutex::new(None);
+static UUID_REGEX: OnceLock<Regex> = OnceLock::new();
 static JOBJECT: OnceLock<GlobalRef> = OnceLock::new();
 
 fn init_thread(event: Event, env: &mut JNIEnv, lock: &mut Option<Sender<Event>>) {
@@ -418,6 +436,9 @@ pub extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundService_i
     */
     log_panics::init();
     JOBJECT.set(env.new_global_ref(callback).unwrap()).unwrap();
+    UUID_REGEX
+        .set(Regex::new("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap())
+        .unwrap();
 }
 
 #[no_mangle]
