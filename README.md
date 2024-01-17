@@ -1,7 +1,7 @@
 # listenbrainz-poweramp
 A PowerAmp plugin specifically for scrobbling your music to ListenBrainz
 
-## Install the APK [here](https://github.com/StratusFearMe21/listenbrainz-poweramp/releases/lastest)
+## Install the APK [here](https://github.com/StratusFearMe21/listenbrainz-poweramp/releases/latest)
 
 ## Building
 First, you need to build the NDK libraries
