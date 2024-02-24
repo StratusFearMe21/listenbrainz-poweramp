@@ -1,8 +1,10 @@
 use std::{
+    backtrace::Backtrace,
     ffi::CStr,
     fmt::Debug,
     io::BufWriter,
     num::NonZeroU64,
+    ops::Deref,
     os::fd::FromRawFd,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -389,6 +391,51 @@ pub extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundService_i
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Trace),
     );
+    let vm = env.get_java_vm().unwrap();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>");
+        let mut env = vm.attach_current_thread().unwrap();
+        *EVENT_LOOP_SENDER.lock() = None;
+        let mut error = String::new();
+        let msg = match panic_info.payload().downcast_ref::<&'static str>() {
+            Some(s) => *s,
+            None => match panic_info.payload().downcast_ref::<String>() {
+                Some(s) => &**s,
+                None => "Box<Any>",
+            },
+        };
+        match panic_info.location() {
+            Some(location) => {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut error,
+                    format_args!(
+                        "panic on thread '{}' panicked at '{}': {}:{}",
+                        thread,
+                        msg,
+                        location.file(),
+                        location.line(),
+                    ),
+                );
+            }
+            None => {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut error,
+                    format_args!("panic on thread '{}' panicked at '{}'", thread, msg),
+                );
+            }
+        }
+        let backtrace = Backtrace::force_capture();
+        std::fmt::Write::write_fmt(&mut error, format_args!("\n\n{}", backtrace)).unwrap();
+        let output = env.new_string(error).unwrap();
+        env.call_method(
+            JOBJECT.get().unwrap(),
+            "crashNotify",
+            "(Ljava/lang/String;)V",
+            &[output.deref().into()],
+        )
+        .unwrap();
+    }));
     /*
     std::panic::set_hook(Box::new(|panic_info| {
         let thread = std::thread::current();
@@ -434,7 +481,7 @@ pub extern "system" fn Java_com_example_listenbrainzpoweramp_ForegroundService_i
         }
     }));
     */
-    log_panics::init();
+    // log_panics::init();
     JOBJECT.set(env.new_global_ref(callback).unwrap()).unwrap();
     UUID_REGEX
         .set(Regex::new("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap())

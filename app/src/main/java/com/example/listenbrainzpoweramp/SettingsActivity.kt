@@ -22,6 +22,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
+import androidx.preference.PreferenceManager
 import java.util.jar.Manifest
 
 class SettingsActivity : AppCompatActivity() {
@@ -34,7 +35,7 @@ class SettingsActivity : AppCompatActivity() {
         if (savedInstanceState == null) {
             supportFragmentManager
                 .beginTransaction()
-                .replace(R.id.settings, SettingsFragment())
+                .replace(R.id.settings, SettingsFragment(intent))
                 .commit()
         }
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
@@ -77,7 +78,7 @@ class SettingsActivity : AppCompatActivity() {
             // Set the positive button with yes name Lambda OnClickListener method is use of DialogInterface interface.
             builder.setPositiveButton("Add a music directory") {
                 // When the user click yes button then app will close
-                dialog, which -> documentTreeOpener.launch(null)
+                _, _ -> documentTreeOpener.launch(null)
             }
 
             // Create the Alert dialog
@@ -88,9 +89,15 @@ class SettingsActivity : AppCompatActivity() {
         applicationContext.startForegroundService(serviceIntent)
     }
 
-    class SettingsFragment : PreferenceFragmentCompat() {
+    class SettingsFragment(intent: Intent) : PreferenceFragmentCompat() {
         private lateinit var documentTreeOpener: ActivityResultLauncher<Uri?>
+        val error: String? = intent.getStringExtra("error")
+
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+            if (error != null) {
+                val sharedPreferences = PreferenceManager.getDefaultSharedPreferences(this.requireContext())
+                sharedPreferences.edit().putString("error", error).commit()
+            }
             setPreferencesFromResource(R.xml.root_preferences, rootKey)
             documentTreeOpener = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) {
                 it?.let { root ->

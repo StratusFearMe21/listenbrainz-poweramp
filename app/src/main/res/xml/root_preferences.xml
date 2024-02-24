@@ -36,4 +36,8 @@
         <PreferenceCategory app:title="This app runs in the background. Once you've input all these settings, you can simply start listening to music">
         </PreferenceCategory>
 
+        <EditTextPreference
+                app:title="Last Recorded Error"
+                app:key="error"/>
+
 </PreferenceScreen>

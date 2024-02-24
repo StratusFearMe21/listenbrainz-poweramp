@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.util.Log
 import androidx.preference.PreferenceManager
 import de.justjanne.bitflags.Flag
@@ -43,6 +44,7 @@ enum class MetadataReqFlag(
 class ForegroundService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
     var mTrackIntent: Intent? = null
     var mStatusIntent: Intent? = null
+    var errNotifyNum: Int = 1
     // var mPlayingModeIntent: Intent? = null
     private var isStarted: Boolean = false
 
@@ -83,8 +85,14 @@ class ForegroundService : Service(), SharedPreferences.OnSharedPreferenceChangeL
                 "Foreground Service Channel", NotificationManager.IMPORTANCE_NONE
             )
 
+            val error_chan: NotificationChannel = NotificationChannel(
+                "ErrorChannel",
+                "Foreground Service Error Channel", NotificationManager.IMPORTANCE_DEFAULT
+            )
+
             val service = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             service.createNotificationChannel(chan)
+            service.createNotificationChannel(error_chan)
             threadStopped()
 
             val mTrackReceiver: BroadcastReceiver = object : BroadcastReceiver() {
@@ -241,6 +249,28 @@ class ForegroundService : Service(), SharedPreferences.OnSharedPreferenceChangeL
             .build()
 
         startForeground(1, notification)
+    }
+
+    fun crashNotify(error: String) {
+        val notificationIntent = Intent(this, SettingsActivity::class.java)
+        notificationIntent.putExtra("error", error)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            1,
+            notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification: Notification = Notification.Builder(this, "ErrorChannel")
+            .setContentTitle("Error in Poweramp ListenBrainz")
+            .setContentText(error)
+            .setSmallIcon(R.drawable.baseline_bug)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        errNotifyNum += 1
+        manager.notify(errNotifyNum, notification)
     }
 
     fun getToken(): String {
