@@ -15,10 +15,8 @@ bitflags = "2.4.0"
 flume = { version = "0.11.0", default-features = false }
 jni = "0.21.1"
 log = "0.4.20"
-log-panics = "2.1.0"
 memchr = "2.5.0"
 num_enum = "0.7.0"
-oopsie_woopsie = "4.0.0"
 parking_lot = "0.12.1"
 regex = "1.10.2"
 serde = { version = "1.0.188", features = ["derive"] }
