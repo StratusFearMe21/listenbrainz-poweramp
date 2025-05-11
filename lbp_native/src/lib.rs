@@ -162,18 +162,23 @@ pub enum PowerampState {
     Paused = 2,
 }
 
-fn scrobble(listen_type: &'static str, payload: &Payload, token: &str, cache_path: &Path) {
+async fn scrobble(listen_type: &'static str, payload: &Payload, token: &str, cache_path: &Path) {
     let send = ListenbrainzSingleListen {
         listen_type,
         payload: [payload],
     };
     #[cfg(debug_assertions)]
     log::debug!("{}", serde_json::to_string_pretty(&send).unwrap());
-    let status = ureq::post("https://api.listenbrainz.org/1/submit-listens")
-        .set("Authorization", token)
-        .send_json(send);
-    if status.is_ok() {
-        import_cache(token, cache_path);
+    let status = reqwest::Client::new()
+        .post("https://api.listenbrainz.org/1/submit-listens")
+        .header("Authorization", token)
+        .json(&send)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    if status.is_success() {
+        import_cache(token, cache_path).await;
         return;
     }
     if let Some(listened_at) = payload.listened_at {
@@ -187,7 +192,7 @@ fn scrobble(listen_type: &'static str, payload: &Payload, token: &str, cache_pat
     }
 }
 
-fn import_cache(token: &str, cache_path: &Path) {
+async fn import_cache(token: &str, cache_path: &Path) {
     let mut read_dir = cache_path.read_dir().unwrap();
     let is_occupied = read_dir.next().is_some();
     let is_one_file = read_dir.next().is_none();
@@ -210,11 +215,16 @@ fn import_cache(token: &str, cache_path: &Path) {
         request.extend_from_slice(b"]}");
         #[cfg(debug_assertions)]
         log::debug!("{}", unsafe { std::str::from_utf8_unchecked(&request) });
-        let status = ureq::post("https://api.listenbrainz.org/1/submit-listens")
-            .set("Authorization", token)
-            .set("Content-Type", "json")
-            .send_bytes(&request);
-        if status.is_err() {
+        let status = reqwest::Client::new()
+            .post("https://api.listenbrainz.org/1/submit-listens")
+            .header("Authorization", token)
+            .header("Content-Type", "json")
+            .body(request)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        if status.is_client_error() || status.is_server_error() {
             log::debug!("Error importing {:?}", status);
             return;
         }
@@ -239,93 +249,50 @@ static EVENT_LOOP_SENDER: Mutex<Option<Sender<Event>>> = Mutex::new(None);
 static UUID_REGEX: OnceLock<Regex> = OnceLock::new();
 static JOBJECT: OnceLock<GlobalRef> = OnceLock::new();
 
-fn init_thread(event: Event, env: &mut JNIEnv, lock: &mut Option<Sender<Event>>) {
-    let token = env
-        .call_method(
-            JOBJECT.get().unwrap(),
-            "getToken",
-            "()Ljava/lang/String;",
-            &[],
-        )
-        .unwrap();
-    let token_jstring = match token {
-        JValueGen::Object(o) => JString::from(o),
-        _ => unreachable!(),
-    };
-    let token_javastr = env.get_string(&token_jstring).unwrap();
-    let token_c_str = unsafe { CStr::from_ptr(token_javastr.as_ptr()) };
-    let token = token_c_str.to_str().unwrap().to_string();
-    let cache_path = env
-        .call_method(
-            JOBJECT.get().unwrap(),
-            "getCache",
-            "()Ljava/lang/String;",
-            &[],
-        )
-        .unwrap();
-    let cache_path_jstring = match cache_path {
-        JValueGen::Object(o) => JString::from(o),
-        _ => unreachable!(),
-    };
-    let cache_path_javastr = env.get_string(&cache_path_jstring).unwrap();
-    let cache_path_c_str = unsafe { CStr::from_ptr(cache_path_javastr.as_ptr()) };
-    let cache_path = Path::new(cache_path_c_str.to_str().unwrap()).join("listenbrainz");
-    if !cache_path.exists() {
-        std::fs::create_dir(&cache_path).unwrap();
-    }
-    let mut data = ListenbrainzData {
-        token,
-        cache_path,
-        ..Default::default()
-    };
-    import_cache(&data.token, &data.cache_path);
-    // Maximum 2 events at a time. Track, and Status
-    let (tx, rx): (Sender<Event>, Receiver<Event>) = flume::bounded(2);
+#[tokio::main(flavor = "current_thread")]
+async fn init_thread(event: Event, mut data: ListenbrainzData, rx: Receiver<Event>) {
+    import_cache(&data.token, &data.cache_path).await;
+    log::info!("Opening thread");
 
-    *lock = Some(tx);
-    std::thread::spawn(move || {
-        log::info!("Opening thread");
-
-        handle_event(event, &mut data);
-        'mainloop: loop {
-            let event = if data.timeout {
-                if Instant::now() >= data.scrobble_deadline {
-                    log::info!("Waiting");
-                    rx.recv().map_err(|e| e.into())
-                } else {
-                    log::info!(
-                        "Waiting: {:?}",
-                        data.scrobble_deadline.duration_since(Instant::now())
-                    );
-                    rx.recv_deadline(data.scrobble_deadline)
-                }
-            } else {
+    handle_event(event, &mut data).await;
+    'mainloop: loop {
+        let event = if data.timeout {
+            if Instant::now() >= data.scrobble_deadline {
                 log::info!("Waiting");
                 rx.recv().map_err(|e| e.into())
-            };
-            match event {
-                Ok(event) => handle_event(event, &mut data),
-                Err(RecvTimeoutError::Timeout) => {
-                    if data.scrobble {
-                        data.payload.listened_at = NonZeroU64::new(
-                            SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                        );
-                        scrobble("single", &data.payload, &data.token, &data.cache_path);
-                    }
-                    data.scrobble = false;
-                    data.timeout = false;
-                }
-                Err(RecvTimeoutError::Disconnected) => break 'mainloop,
+            } else {
+                log::info!(
+                    "Waiting: {:?}",
+                    data.scrobble_deadline.duration_since(Instant::now())
+                );
+                rx.recv_deadline(data.scrobble_deadline)
             }
+        } else {
+            log::info!("Waiting");
+            rx.recv().map_err(|e| e.into())
+        };
+        match event {
+            Ok(event) => handle_event(event, &mut data).await,
+            Err(RecvTimeoutError::Timeout) => {
+                if data.scrobble {
+                    data.payload.listened_at = NonZeroU64::new(
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    );
+                    scrobble("single", &data.payload, &data.token, &data.cache_path).await;
+                }
+                data.scrobble = false;
+                data.timeout = false;
+            }
+            Err(RecvTimeoutError::Disconnected) => break 'mainloop,
         }
-        log::info!("Closing thread");
-    });
+    }
+    log::info!("Closing thread");
 }
 
-fn handle_event(event: Event, data: &mut ListenbrainzData) {
+async fn handle_event(event: Event, data: &mut ListenbrainzData) {
     match event {
         Event::TrackChanged(metadata, pos, now, data_scrobble) => {
             data.payload.track_metadata = metadata;
@@ -350,7 +317,7 @@ fn handle_event(event: Event, data: &mut ListenbrainzData) {
                 data.scrobble_deadline = now + scrobble_deadline;
 
                 data.payload.listened_at = None;
-                scrobble("playing_now", &data.payload, &data.token, &data.cache_path);
+                scrobble("playing_now", &data.payload, &data.token, &data.cache_path).await;
             }
         }
         Event::StateChanged(state) => match state {
@@ -378,7 +345,49 @@ fn send_event(event: Event, env: &mut JNIEnv) {
     if let Some(tx) = std::ops::Deref::deref(&lock) {
         tx.send(event).unwrap();
     } else {
-        init_thread(event, env, &mut lock);
+        let token = env
+            .call_method(
+                JOBJECT.get().unwrap(),
+                "getToken",
+                "()Ljava/lang/String;",
+                &[],
+            )
+            .unwrap();
+        let token_jstring = match token {
+            JValueGen::Object(o) => JString::from(o),
+            _ => unreachable!(),
+        };
+        let token_javastr = env.get_string(&token_jstring).unwrap();
+        let token_c_str = unsafe { CStr::from_ptr(token_javastr.as_ptr()) };
+        let token = token_c_str.to_str().unwrap().to_string();
+        let cache_path = env
+            .call_method(
+                JOBJECT.get().unwrap(),
+                "getCache",
+                "()Ljava/lang/String;",
+                &[],
+            )
+            .unwrap();
+        let cache_path_jstring = match cache_path {
+            JValueGen::Object(o) => JString::from(o),
+            _ => unreachable!(),
+        };
+        let cache_path_javastr = env.get_string(&cache_path_jstring).unwrap();
+        let cache_path_c_str = unsafe { CStr::from_ptr(cache_path_javastr.as_ptr()) };
+        let cache_path = Path::new(cache_path_c_str.to_str().unwrap()).join("listenbrainz");
+        if !cache_path.exists() {
+            std::fs::create_dir(&cache_path).unwrap();
+        }
+        let data = ListenbrainzData {
+            token,
+            cache_path,
+            ..Default::default()
+        };
+        // Maximum 2 events at a time. Track, and Status
+        let (tx, rx): (Sender<Event>, Receiver<Event>) = flume::bounded(2);
+
+        *lock = Some(tx);
+        std::thread::spawn(move || init_thread(event, data, rx));
     }
 }
 
